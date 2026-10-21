@@ -1,0 +1,180 @@
+# AI Audit Log (CIC-307 NetArchitect)
+
+Four places where AI-generated networking code was wrong. For each: the prompt, the
+buggy code, the technical analysis (with packet-flow reasoning), and the fix that is
+now in this repository. The "Observed output" blocks are the real output of running
+the buggy snippet (`python3`), and each fix is locked in by a unit test.
+
+| # | Area | Flaw | Fixed in | Regression test |
+|---|------|------|----------|-----------------|
+| 1 | Bitwise masks | `~mask` yields a negative Python int | `netarchitect/vlsm.py::wildcard_from_prefix` | `tests/test_vlsm.py::test_wildcard_masks`, `test_wildcard_never_negative` |
+| 2 | VLSM sizing | Forgot network + broadcast (+2) | `netarchitect/vlsm.py::prefix_for_hosts` | `test_prefix_for_hosts_boundaries` |
+| 3 | Optical budget | Ignored connector loss; one budget for every optic | `netarchitect/media.py` | `test_optical_budget_warning_and_margin`, `test_smf_beyond_400m` |
+| 4 | Switchport trunks | Unconstrained trunk (all VLANs, native VLAN 1, DTP on) | `netarchitect/configs.py::_access/_core` | `test_configs_have_core_pieces` |
+
+---
+
+## Incident 1 - Wildcard mask via Python `~` (bitwise error)
+
+**Prompt:** "Write a Python function that returns the Cisco wildcard mask for a prefix length, using bitwise operations."
+
+**Buggy AI code**
+```python
+def wildcard(prefix):
+    mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+    return ~mask            # "invert the mask"
+```
+
+**Observed output** (network `10.1.2.0`, `/24`)
+```
+broadcast raw = -4127128833 | in range 0..2^32-1? False | ip() = 10.1.2.255
+struct.pack('!I') -> error 'I' format requires 0 <= number <= 4294967295
+```
+
+**Analysis.** C and hardware ALUs work on 32-bit unsigned values, so `~mask` is the
+32-bit inverse. Python integers have unlimited width, so `~x == -x - 1`: the result is a
+*negative* number with infinite leading 1-bits. Printing it through a `>> & 255`
+dotted-quad formatter hides the problem (it printed `10.1.2.255`), but every
+arithmetic or comparison step that treats it as an address is wrong: the broadcast
+(`network | wildcard`) falls outside 0..2^32-1, cannot be packed into a 4-byte field, and
+breaks range/overlap comparisons against real addresses. In the generated config this would
+feed the `network <addr> <wildcard> area N` and ACL lines; a wrong wildcard there changes
+which interfaces OSPF is enabled on, or which hosts an ACL matches (an ACL
+`permit 10.1.2.0 0.0.0.255` matches 256 addresses; a corrupt wildcard silently matches
+the wrong set of source addresses, e.g. letting guest traffic reach the server VLAN).
+
+**Final fix**
+```python
+def wildcard_from_prefix(prefix):
+    return ~prefix_to_mask(prefix) & 0xFFFFFFFF   # force 32-bit unsigned
+```
+Verified for all 33 prefixes (`/0 -> 255.255.255.255` ... `/32 -> 0.0.0.0`) and checked
+`0 <= wildcard <= 0xFFFFFFFF`.
+
+---
+
+## Incident 2 - VLSM host-to-prefix maths forgot network and broadcast addresses
+
+**Prompt:** "Give me a function that finds the smallest subnet prefix for N hosts."
+
+**Buggy AI code**
+```python
+import math
+def prefix(hosts):
+    return 32 - math.ceil(math.log2(hosts))
+```
+
+**Observed output**
+```
+hosts=  2 buggy=/31 usable=  0 OVERFLOW fixed=/30
+hosts= 32 buggy=/27 usable= 30 OVERFLOW fixed=/26
+hosts= 64 buggy=/26 usable= 62 OVERFLOW fixed=/25
+hosts=128 buggy=/25 usable=126 OVERFLOW fixed=/24
+hosts=256 buggy=/24 usable=254 OVERFLOW fixed=/23
+hosts=512 buggy=/23 usable=510 OVERFLOW fixed=/22
+```
+It happens to work for 6, 14 and 30 hosts, which is why a casual test passes.
+
+**Analysis.** A subnet of 2^h addresses has only 2^h - 2 usable hosts (the all-zeros
+network address and all-ones broadcast cannot be assigned). The AI sized for `hosts`
+addresses instead of `hosts + 2`, so every power-of-two request is undersized. Packet-flow
+consequence: a /24 asked to hold 256 hosts has 254 usable addresses; the last two hosts
+get no address, or if someone assigns `.0` / `.255` to a host, frames sent to the
+directed broadcast `.255` are flooded to everyone and the host never receives unicast
+replies. A /31 for "2 hosts" is only valid on point-to-point links (RFC 3021) and our
+tool deliberately uses /30 for those.
+
+**Final fix**
+```python
+host_bits = (hosts + 2 - 1).bit_length()      # smallest n with 2^n >= hosts + 2
+return min(32 - host_bits, 30)                # never smaller than /30
+```
+Boundaries (`1,2,3,6,7,14,30,31,62,126,127,254,255,510,511`) are asserted in
+`test_prefix_for_hosts_boundaries`; `allocate()` additionally asserts `usable >= hosts`
+and zero overlap on every run.
+
+---
+
+## Incident 3 - Incorrect optical power budget
+
+**Prompt:** "Calculate whether 10GBASE-LR works over a given fibre distance and report the link margin."
+
+**Buggy AI code**
+```python
+def margin(km, budget_db=6.2, atten=0.35):
+    return budget_db - km * atten        # same constants for every optic
+```
+
+**Observed output**
+```
+LR 10 km margin (buggy, no connectors) = 2.70 dB
+LR 10 km margin (fixed)                = 1.70 dB
+ER 40 km using the LR budget           = -7.80 dB  (reports a good ER link as failing)
+```
+
+**Analysis.** Two errors. (a) Two mated connector pairs add about 0.5 dB each, so the
+real margin at 10 km is 1.0 dB lower than reported: the design looks 2.7 dB healthy when it
+has only 1.7 dB, hiding the margin-erosion risk from splices, dirty ferrules and ageing.
+(b) A single budget and attenuation value was reused for every optic, but 10GBASE-LR
+(1310 nm, ~0.35 dB/km, 6.2 dB budget) and 10GBASE-ER (1550 nm, ~0.25 dB/km, 11 dB budget)
+differ. Applied to a 40 km ER link it wrongly reports failure and would steer the
+engine away from the correct optic. Packet-flow impact: marginal optical power raises the
+bit-error rate, frames fail the FCS check, and the symptom is intermittent CRC errors and
+TCP retransmits rather than a clean link-down, which is hard to diagnose in production.
+
+**Final fix.** `OPTICS` holds a per-optic budget, attenuation and wavelength;
+`link_loss_db()` adds `2 x 0.5 dB` connector loss; `recommend_media()` picks LR (<=10 km),
+ER (<=40 km) or ZR (<=80 km), prints the loss and margin in the justification and warns
+below a 1 dB margin. Beyond 80 km no unamplified 10G optic exists, so a carrier circuit
+is recommended. (Budget numbers are design values: confirm them against the datasheet of
+the transceiver purchased.)
+
+---
+
+## Incident 4 - Unconstrained switchport trunk
+
+**Prompt:** "Generate Cisco IOS config for the access switch uplink trunk and edge ports."
+
+**Buggy AI config**
+```
+interface GigabitEthernet0/1
+ switchport mode trunk
+!
+interface range FastEthernet0/1-4
+ switchport mode access
+ switchport access vlan 10
+```
+
+**Analysis (packet flow).**
+1. `switchport mode trunk` with no `allowed vlan` carries **all 4094 VLANs**, so broadcasts
+   of VLANs that do not exist at this site (e.g. management or guest VLANs of other
+   buildings) are flooded over the uplink and a spanning-tree loop in any VLAN spreads.
+2. The native VLAN defaults to 1, whose frames cross the trunk **untagged**. An attacker on
+   an access port can send a frame with two 802.1Q tags (outer = native VLAN 1, inner = target
+   VLAN 20). The first switch strips the outer tag and forwards the frame, still tagged for
+   VLAN 20, onto the trunk: the target VLAN receives traffic the attacker should never reach
+   (**double-tagging VLAN hopping**).
+3. DTP is on by default, so a laptop sending DTP frames can negotiate itself into a trunk.
+4. Access ports without PortFast/BPDU guard wait for STP and accept a rogue switch's BPDUs;
+   no port security means unlimited MACs (CAM-table flooding).
+
+**Final fix (generated by `configs.py`)**
+```
+spanning-tree mode rapid-pvst
+spanning-tree portfast bpduguard default
+interface GigabitEthernet0/1
+ switchport mode trunk
+ switchport trunk native vlan 999          ! unused VLAN, never carries user traffic
+ switchport trunk allowed vlan 10,20,30    ! only VLANs that exist at this site
+ switchport nonegotiate                    ! DTP off
+interface range FastEthernet0/1-4
+ switchport mode access
+ switchport access vlan 10
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+```
+`test_configs_have_core_pieces` asserts the allowed-VLAN list, native VLAN 999,
+`nonegotiate` and BPDU guard appear in the generated access-switch config.
